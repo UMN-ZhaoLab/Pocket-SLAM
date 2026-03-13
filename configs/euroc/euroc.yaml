@@ -1,0 +1,12 @@
+dataset_name: 'euroc'
+camera_params:
+  image_height: 480
+  image_width: 752
+  fx: 435.2046959714599
+  fy: 435.2046959714599
+  cx: 367.4517211914062
+  cy: 252.2008514404297
+  png_depth_scale: 1.0
+  crop_edge: 0
+  depth_filter_near: 0.1
+  depth_filter_far: 10.0

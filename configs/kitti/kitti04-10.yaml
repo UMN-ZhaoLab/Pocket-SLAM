@@ -1,0 +1,12 @@
+dataset_name: 'kitti'
+camera_params:
+  image_height: 370
+  image_width: 1226
+  fx: 7.070912000000e+02
+  fy: 7.070912000000e+02
+  cx: 6.018873000000e+02
+  cy: 1.831104000000e+02
+  png_depth_scale: 1.0
+  crop_edge: 0
+  depth_filter_near: 0.1
+  depth_filter_far: 30.0
