@@ -1,4 +1,7 @@
-# Pocket-SLAM
+# Pocket-SLAM: Rendering-Area-Aware Pruning for Memory-Efficient 3DGS-SLAM
+
+This is the official implementation of Pocket-SLAM: Rendering-Area-Aware Pruning for
+Memory-Efficient 3DGS-SLAM [ICRA'26]
 
 Pocket-SLAM is built on top of [LSG-SLAM](https://github.com/lsg-slam/LSG-SLAM) and introduces memory-efficient Gaussian pruning for large-scale outdoor SLAM via two complementary strategies:
 
