@@ -63,6 +63,17 @@ Config: `configs/euroc/full_benchmark.py` (`N_tar=60000`, `B_max=200`, 100 track
 
 Results are written to `results/full_benchmark/` (`summary.txt`, per-run logs).
 
+**Example output** (for reference, from `results/full_benchmark/summary.txt`):
+
+```
+=== COMPARISON (Pocket vs Baseline) ===
+ATE: 813.30 -> 853.59 cm (+40.29 cm, +5.0%)
+FPS: 0.0718 -> 0.3932 (5.48x, +447.6%)
+Peak VRAM: 11.080 -> 4.997 GB (+54.9% reduction)
+Final Gaussians: 8,512,714 -> 55,908 (99.3% reduction)
+Map size: 422.2 -> 2.8 MB (99.3% reduction)
+```
+
 ## Benchmark results
 
 EuRoC `V2_01_easy`, frames 0–2200, stride 5 (441 keyframes), 100 tracking/mapping iters, 2× RTX A6000.
@@ -77,29 +88,6 @@ EuRoC `V2_01_easy`, frames 0–2200, stride 5 (441 keyframes), 100 tracking/mapp
 | Wall time | ~112 min | ~27 min | **~4× faster** |
 
 Pocket-SLAM trades a small ATE increase for large memory and speed gains on this long outdoor sequence.
-
-## Code changes (vs upstream)
-
-| File | Change |
-|------|--------|
-| `utils/slam_external.py` | Global cap in `pocket_slam_prune()`; tile-budget pruning |
-| `scripts/loop_closure.py` | Fix mapping to run every frame; adaptive mapping/prune |
-| `datasets/gradslam_datasets/euroc.py` | Use `depth_sgbm/` depth maps |
-| `tools/euroc_parser/operate_euroc_data.py` | SGBM depth by default; `EUROC_DIR` env var |
-| `configs/euroc/full_benchmark.py` | Full V2_01_easy benchmark config |
-| `run_full_benchmark.py` | Side-by-side baseline vs Pocket benchmark |
-
-Pocket-SLAM config block:
-
-```python
-pocket_slam=dict(
-    enable=True,
-    N_tar=60000,
-    B_min=1,
-    B_max=200,
-    tile_size=16,
-),
-```
 
 ## Acknowledgement
 
