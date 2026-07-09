@@ -1209,12 +1209,17 @@ def rgbd_slam(config: dict, loop):
             # Reset Optimizer & Learning Rates for Full Map Optimization
             optimizer = initialize_optimizer(params, config['mapping']['lrs'], tracking=False) 
 
-            # Mapping
-            if time_idx < 1:
-                mapping_start_time = time.time()
-                if num_iters_mapping > 0:
-                    progress_bar = tqdm(range(num_iters_mapping), desc=f"Mapping Time Step: {time_idx}")
-                for iter in range(num_iters_mapping):
+            # Mapping (every keyframe — was incorrectly gated to frame 0 only)
+            mapping_start_time = time.time()
+            effective_mapping_iters = num_iters_mapping
+            if config.get('pocket_slam', {}).get('enable', False):
+                n_tar = config['pocket_slam'].get('N_tar', 60000)
+                n_gauss = params['means3D'].shape[0]
+                if n_gauss <= int(n_tar * 1.1):
+                    effective_mapping_iters = max(25, num_iters_mapping // 2)
+            if effective_mapping_iters > 0:
+                progress_bar = tqdm(range(effective_mapping_iters), desc=f"Mapping Time Step: {time_idx}")
+            for iter in range(effective_mapping_iters):
                     iter_start_time = time.time()
                     # Randomly select a frame until current time step amongst keyframes
                     rand_idx = np.random.randint(0, len(selected_keyframes))
@@ -1272,33 +1277,34 @@ def rgbd_slam(config: dict, loop):
                     iter_end_time = time.time()
                     mapping_iter_time_sum += iter_end_time - iter_start_time
                     mapping_iter_time_count += 1
-                if num_iters_mapping > 0:
-                    progress_bar.close()
-                # Update the runtime numbers
-                mapping_end_time = time.time()
-                mapping_frame_time_sum += mapping_end_time - mapping_start_time
-                mapping_frame_time_count += 1
+            if effective_mapping_iters > 0:
+                progress_bar.close()
+            mapping_end_time = time.time()
+            mapping_frame_time_sum += mapping_end_time - mapping_start_time
+            mapping_frame_time_count += 1
 
             # Pocket-SLAM: Rendering-Area-Aware Pruning with Tile-Level Budget
             if config.get('pocket_slam', {}).get('enable', False):
                 pocket_cfg = config['pocket_slam']
-                with torch.no_grad():
-                    transformed_gaussians = transform_to_frame(
-                        params, time_idx, gaussians_grad=False, camera_grad=False)
-                    rendervar = transformed_params2rendervar(params, transformed_gaussians)
-                    rendervar['means2D'] = torch.zeros_like(
-                        params['means3D'], requires_grad=False, device="cuda")
-                    _, pocket_radius, _, _ = Renderer(raster_settings=curr_data['cam'])(**rendervar)
-                    pocket_means2D = rendervar['means2D']
-                    map_cam = curr_data['cam']
-                params, variables = pocket_slam_prune(
-                    params, variables, optimizer,
-                    pocket_means2D, pocket_radius,
-                    time_idx,
-                    map_cam.image_height,
-                    map_cam.image_width,
-                    pocket_cfg,
-                )
+                n_tar = pocket_cfg.get('N_tar', 60000)
+                if params['means3D'].shape[0] > int(n_tar * 0.95):
+                    with torch.no_grad():
+                        transformed_gaussians = transform_to_frame(
+                            params, time_idx, gaussians_grad=False, camera_grad=False)
+                        rendervar = transformed_params2rendervar(params, transformed_gaussians)
+                        rendervar['means2D'] = torch.zeros_like(
+                            params['means3D'], requires_grad=False, device="cuda")
+                        _, pocket_radius, _, _ = Renderer(raster_settings=curr_data['cam'])(**rendervar)
+                        pocket_means2D = rendervar['means2D']
+                        map_cam = curr_data['cam']
+                    params, variables = pocket_slam_prune(
+                        params, variables, optimizer,
+                        pocket_means2D, pocket_radius,
+                        time_idx,
+                        map_cam.image_height,
+                        map_cam.image_width,
+                        pocket_cfg,
+                    )
                 # Reset pocket accumulators for next tracking round
                 N_after = params['means3D'].shape[0]
                 variables['pocket_grad_accum'] = torch.zeros(N_after, device="cuda").float()

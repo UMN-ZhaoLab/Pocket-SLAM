@@ -354,6 +354,41 @@ def pocket_slam_prune(params, variables, optimizer, means2D, radius,
         torch.cuda.empty_cache()
         print(f"[Pocket-SLAM] Pruned {pruned} Gaussians → remaining: {params['means3D'].shape[0]}")
 
+    # Global cap: tile budgets are per-tile and out-of-frame Gaussians are kept,
+    # so enforce N_tar with a gradient-aware global top-k pass.
+    N_after = params['means3D'].shape[0]
+    if N_after > N_tar:
+        grad_score = variables.get('pocket_grad_accum', torch.zeros(N_after, device='cuda'))
+        grad_score = grad_score / (variables.get('pocket_denom', torch.ones(N_after, device='cuda')) + 1e-8)
+        grad_score = grad_score.detach()
+        grad_score[grad_score.isnan()] = 0.0
+        if grad_score.max() > 0:
+            grad_score = grad_score / (grad_score.max() + 1e-8)
+
+        opacities = torch.sigmoid(params['logit_opacities']).squeeze(-1).detach()
+        opacity_score = opacities / (opacities.max() + 1e-8)
+        combined = 0.5 * opacity_score + 0.5 * grad_score
+
+        # Always protect Gaussians added in the current mapping round.
+        protected = (variables['timestep'] == time_idx)
+        keep_mask = torch.zeros(N_after, dtype=torch.bool, device='cuda')
+        n_protected = int(protected.sum().item())
+        n_slots = max(N_tar - n_protected, 0)
+
+        if n_slots > 0:
+            scores = combined.clone()
+            scores[protected] = -1.0
+            _, top_idx = torch.topk(scores, k=min(n_slots, N_after - n_protected))
+            keep_mask[top_idx] = True
+        keep_mask |= protected
+
+        to_remove = ~keep_mask
+        removed = int(to_remove.sum().item())
+        if removed > 0:
+            params, variables = remove_points(to_remove, params, variables, optimizer)
+            torch.cuda.empty_cache()
+            print(f"[Pocket-SLAM] Global cap pruned {removed} → remaining: {params['means3D'].shape[0]}")
+
     return params, variables
 
 

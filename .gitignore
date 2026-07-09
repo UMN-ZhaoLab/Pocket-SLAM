@@ -5,6 +5,11 @@ experiments/
 results/
 wandb/
 .vscode
+/euroc/
+/euroc_*/
+/euroc_benchmark_*/
+/euroc_full_*/
+.torch_cache/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

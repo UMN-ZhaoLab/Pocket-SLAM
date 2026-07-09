@@ -45,8 +45,7 @@ class EurocDataset(GradSLAMDataset):
 
     def get_filepaths(self):
         color_paths = natsorted(glob.glob(f"{self.input_folder}/data_rect/*.png"))
-        depth_paths = natsorted(glob.glob(f"{self.input_folder}/depth_sceneflow/*.npy"))
-        # depth_paths = natsorted(glob.glob(f"{self.input_folder}/depth_sgbm/*.npy"))
+        depth_paths = natsorted(glob.glob(f"{self.input_folder}/depth_sgbm/*.npy"))
         feature_paths = natsorted(glob.glob(f"{self.input_folder}/global_features/*.npy"))
         embedding_paths = None
         if self.load_embeddings:

@@ -82,20 +82,22 @@ cam1_mapx, cam1_mapy = cv2.initUndistortRectifyMap(
 )
 
 # # params
-base_path = '' # path to euroc dataset
+_repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+base_path = os.environ.get("EUROC_DIR", os.path.join(_repo_root, "euroc"))
 igev_sceneflow_model_path = '../../third_party/IGEV-Stereo/pretrained_models/sceneflow.pth'
 vpr_model_path = '../../third_party/TransVPR/TransVPR_MSLS.pth'
 
 scene_names = [
     "V2_01_easy",
 ]
+MAX_FRAMES = 100000  # process all available frames
 
 for scene_name in scene_names:
     print(scene_name)
     dataset_path = os.path.join(base_path, scene_name)
     run_stereo_rectify = True
-    run_depth_sgbm = False
-    run_depth_igev = True
+    run_depth_sgbm = True
+    run_depth_igev = False
     run_get_gt_pose = True
     run_global_feature = True
 
@@ -131,8 +133,9 @@ for scene_name in scene_names:
             print('cam0 and cam1 are not equal')
             exit()
 
-    cam0_images_path = sorted(cam0_images_path, key=lambda x: float(x[:-4]))
-    cam1_images_path = sorted(cam1_images_path, key=lambda x: float(x[:-4]))
+    cam0_images_path = sorted(cam0_images_path, key=lambda x: float(x[:-4]))[:MAX_FRAMES]
+    cam1_images_path = sorted(cam1_images_path, key=lambda x: float(x[:-4]))[:MAX_FRAMES]
+    number_of_images = len(cam0_images_path)
 
     if run_stereo_rectify:
         for i in tqdm(range(number_of_images)):
