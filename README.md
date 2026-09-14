@@ -83,6 +83,32 @@ python tools/loop_closure/pose_graph_part_optim.py
 
 Baseline (no Pocket pruning): set `pocket_slam.enable=False` in the config.
 
+## One-click: V2_01_easy Baseline vs Pocket (validated)
+
+Reproduces the full LSG pipeline numbers below on **EuRoC `V2_01_easy`**
+(`0–2200`, stride `5`, chunk step `200` → loop → pose-graph → structure refine):
+
+| Method | ATE (loop) | PSNR | MS-SSIM | LPIPS |
+|--------|------------|------|---------|-------|
+| LSG Baseline | 6.64 cm | 32.50 | 0.984 | 0.037 |
+| Pocket-SLAM | 6.38 cm | 32.04 | 0.982 | 0.042 |
+
+```bash
+# Requires euroc/V2_01_easy with data_rect + traj + global_features.
+# IGEV depth_sceneflow is generated automatically if missing.
+python reproduce_v2_lsg_baseline_vs_pocket.py --gpu 0
+
+# Faster ATE-only (skip map refine / PSNR):
+python reproduce_v2_lsg_baseline_vs_pocket.py --gpu 0 --ate_only
+
+# Delete previous workdirs and rerun from scratch:
+python reproduce_v2_lsg_baseline_vs_pocket.py --gpu 0 --fresh
+```
+
+Outputs:
+- workdirs: `euroc_lsg_v2_baseline/`, `euroc_lsg_v2_pocket/`
+- summary: `results/v2_lsg_reproduce/summary.txt`
+
 ## Paper results (EuRoC Table I/II)
 
 | Metric | LSG-SLAM | Pocket-SLAM (w/ tile budget) |
