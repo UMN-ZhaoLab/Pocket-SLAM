@@ -2,33 +2,33 @@ import os
 from os.path import join as p_join
 from datetime import datetime
 
-scenes = ["V2_01_easy"]
+scenes = ["MH_01_easy"]
 
 primary_device="cuda:0"
 seed = 0
-scene_name = 'MH_05_difficult'
+scene_name = 'MH_01_easy'
 
 map_every = 1
 keyframe_every = 1
 mapping_window_size = 24 #default: 24
 
-tracking_iters = 100
+# Paper (Sec. IV Implementation Details): 50 tracking / 100 mapping iters
+tracking_iters = 50
 mapping_iters = 100
 run_loop_closure = True
 
 image_width = 752
 image_height = 480
 
-start_idx = 400
-end_idx = 2220
+# MH01 paper range (see bash_scripts/run_euroc_sequence.bash)
+# MH_01_easy: 900–3630; MH_02: 780–2990; MH_03: 350–2600;
+# MH_04: 368–1970; MH_05: 400–2220. stride=5.
+start_idx = 900
+end_idx = 3630
 stride = 5
 
-group_name = "euroc_200"
-# ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-# run_name = f"{scene_name}_{seed}"
+group_name = "euroc_paper"
 run_name = f"{scene_name}_{start_idx}_{end_idx}_{stride}"
-# run_name = run_name + '_' + ts
-# run_name = 'MH_02_easy_1882_2882_5_sw_24'
 
 config = dict(
     workdir=f"{group_name}",
@@ -86,7 +86,7 @@ config = dict(
         icp_corr_threshold=0.5,
         loss_weights=dict(
             im=1.0,
-            depth=0.2,
+            depth=1.0,  # paper λ_d = 1.0 (Eq. 3)
         ),
         lrs=dict(
             means3D=0.0,
@@ -107,7 +107,7 @@ config = dict(
         ignore_outlier_depth_loss=False,
         loss_weights=dict(
             im=0.5,
-            depth=1.0,
+            depth=1.5,  # paper λ_d* = 1.5 (Eq. 7)
         ),
         lrs=dict(
             means3D=0.0001,
@@ -144,10 +144,19 @@ config = dict(
     ),
     pocket_slam=dict(
         enable=True,
-        N_tar=60000,
-        B_min=1,
-        B_max=2000,
+        # Paper default N_tar_ratio=0.4; 0.7 leans quality vs compression.
+        N_tar_ratio=0.7,
+        N_tar=None,
+        B_min=5,
+        B_max=200,
         tile_size=16,
+        global_cap=False,
+        protect_age=0,
+        warmup_frames=1,
+        prune_interval=1,
+        prune_margin=1.0,
+        score_opacity_weight=0.0,
+        post_prune_iters=30,
     ),
     viz=dict(
         render_mode='color', # ['color', 'depth' or 'centers']

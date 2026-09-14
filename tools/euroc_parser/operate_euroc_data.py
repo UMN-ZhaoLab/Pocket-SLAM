@@ -88,7 +88,11 @@ igev_sceneflow_model_path = '../../third_party/IGEV-Stereo/pretrained_models/sce
 vpr_model_path = '../../third_party/TransVPR/TransVPR_MSLS.pth'
 
 scene_names = [
-    "V2_01_easy",
+    "MH_01_easy",
+    # "MH_02_easy",
+    # "MH_03_medium",
+    # "MH_04_difficult",
+    # "MH_05_difficult",
 ]
 MAX_FRAMES = 100000  # process all available frames
 
@@ -96,8 +100,9 @@ for scene_name in scene_names:
     print(scene_name)
     dataset_path = os.path.join(base_path, scene_name)
     run_stereo_rectify = True
-    run_depth_sgbm = True
-    run_depth_igev = False
+    # Paper / LSG-SLAM: IGEV SceneFlow depth. SGBM is only a fallback.
+    run_depth_sgbm = False
+    run_depth_igev = True
     run_get_gt_pose = True
     run_global_feature = True
 

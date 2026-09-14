@@ -2,6 +2,8 @@
 
 Official implementation of Pocket-SLAM (ICRA'26), built on [LSG-SLAM](https://github.com/lsg-slam/LSG-SLAM).
 
+Paper: [arXiv:2606.24796](https://arxiv.org/abs/2606.24796)
+
 ## Quick start
 
 ### 1. Install
@@ -23,71 +25,79 @@ cd ..
 ### 2. Download weights
 
 ```bash
-# TransVPR (clone LSG-SLAM or copy weights manually)
 git clone --depth 1 https://github.com/lsg-slam/LSG-SLAM /tmp/LSG-SLAM
 cp /tmp/LSG-SLAM/third_party/TransVPR/TransVPR_MSLS.pth third_party/TransVPR/
 cp /tmp/LSG-SLAM/sp_lg/superpoint_v1.pth /tmp/LSG-SLAM/sp_lg/superpoint_lightglue.pth sp_lg/
 
-# IGEV (optional; preprocessing below uses SGBM depth by default)
 mkdir -p third_party/IGEV-Stereo/pretrained_models
 gdown --folder https://drive.google.com/drive/folders/1SsMHRyN7808jDViMN1sKz1Nx-71JxUuz \
   -O third_party/IGEV-Stereo/pretrained_models
+# Ensure sceneflow.pth is at:
+#   third_party/IGEV-Stereo/pretrained_models/sceneflow.pth
 ```
 
-### 3. Download & preprocess EuRoC
+### 3. Download & preprocess EuRoC (MH01–MH05)
 
-Download [EuRoC MAV](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets) (`V2_01_easy`).
+Paper tables use **Machine Hall** sequences `MH_01_easy` … `MH_05_difficult` (not V2).
 
 ```bash
-export EUROC_DIR=/path/to/euroc          # contains V2_01_easy/
-ln -sf $EUROC_DIR euroc                  # or edit base_path in operate_euroc_data.py
+# Download from EuRoC (needs network access to ETHZ):
+# http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/machine_hall/
 
+export EUROC_DIR=/path/to/euroc   # contains MH_01_easy/, MH_02_easy/, ...
+ln -sfn $EUROC_DIR euroc
+
+# Edit tools/euroc_parser/operate_euroc_data.py → scene_names = ["MH_01_easy", ...]
+# Must use IGEV depth (depth_sceneflow/), NOT SGBM.
 python tools/euroc_parser/operate_euroc_data.py
 ```
 
-This generates rectified images, SGBM depth (`depth_sgbm/`), poses (`traj.txt`), and global features under `euroc/V2_01_easy/mav0/cam0/`.
+Preprocessing writes under `euroc/<seq>/mav0/cam0/`:
+`data_rect/`, **`depth_sceneflow/`**, `traj.txt`, `global_features/`.
 
-### 4. Run benchmark (baseline vs Pocket-SLAM)
+### 4. Run (paper pipeline)
 
-Full-sequence comparison on EuRoC `V2_01_easy`, frames 0–2200, stride 5:
+Frame ranges (stride=5), from `bash_scripts/run_euroc_sequence.bash`:
+
+| Sequence | start | end |
+|----------|------:|----:|
+| MH_01_easy | 900 | 3630 |
+| MH_02_easy | 780 | 2990 |
+| MH_03_medium | 350 | 2600 |
+| MH_04_difficult | 368 | 1970 |
+| MH_05_difficult | 400 | 2220 |
+
+Paper hyperparameters (`configs/euroc/lsgslam.py`):
+
+- tracking iters **50**, mapping iters **100**
+- tracking depth weight **1.0**, mapping depth weight **1.5**
+- `N_tar = 0.4 * N_init`, `B_min=5`, `B_max=200`
 
 ```bash
-# 2 GPUs in parallel (GPU 0 = LSG baseline, GPU 1 = Pocket-SLAM)
-python run_full_benchmark.py
+# Frontend (+ loop finding / segment re-runs)
+python scripts/loop_closure.py configs/euroc/lsgslam.py
 
-# Or run Pocket-SLAM only
-python scripts/loop_closure.py configs/euroc/full_benchmark.py
+# Backend pose-graph + structure refine (required for paper-level ATE)
+python tools/loop_closure/pose_graph_part_optim.py
 ```
 
-Config: `configs/euroc/full_benchmark.py` (`N_tar=60000`, `B_max=200`, 100 tracking/mapping iters).
+Baseline (no Pocket pruning): set `pocket_slam.enable=False` in the config.
 
-Results are written to `results/full_benchmark/` (`summary.txt`, per-run logs).
+## Paper results (EuRoC Table I/II)
 
-**Example output** (for reference, from `results/full_benchmark/summary.txt`):
+| Metric | LSG-SLAM | Pocket-SLAM (w/ tile budget) |
+|--------|----------|------------------------------|
+| MH01 ATE (m) | 0.05 | 0.05 |
+| MH01 PSNR | 31.23 | 31.05 |
+| Avg peak mem (GB) | 25.4 | 10.1 |
+| Avg FPS | 1.3 | 3.6 |
 
-```
-=== COMPARISON (Pocket vs Baseline) ===
-ATE: 813.30 -> 853.59 cm (+40.29 cm, +5.0%)
-FPS: 0.0718 -> 0.3932 (5.48x, +447.6%)
-Peak VRAM: 11.080 -> 4.997 GB (+54.9% reduction)
-Final Gaussians: 8,512,714 -> 55,908 (99.3% reduction)
-Map size: 422.2 -> 2.8 MB (99.3% reduction)
-```
+## Common reproduction pitfalls
 
-## Benchmark results
-
-EuRoC `V2_01_easy`, frames 0–2200, stride 5 (441 keyframes), 100 tracking/mapping iters, 2× RTX A6000.
-
-| Metric | LSG-SLAM (baseline) | Pocket-SLAM | Change |
-|--------|---------------------|-------------|--------|
-| FPS | 0.072 | 0.393 | **5.5×** |
-| Peak VRAM | 11.1 GB | 5.0 GB | **−55%** |
-| Final Gaussians | 8,512,714 | 55,908 | **−99.3%** |
-| Map size | 422 MB | 2.8 MB | **−99.3%** |
-| ATE RMSE | 813 cm | 854 cm | +5% |
-| Wall time | ~112 min | ~27 min | **~4× faster** |
-
-Pocket-SLAM trades a small ATE increase for large memory and speed gains on this long outdoor sequence.
+1. **SGBM depth** → ATE/PSNR collapse. Use **IGEV `depth_sceneflow`**.
+2. **Skip pose-graph backend** → worse ATE than Table I.
+3. **Wrong sequence / frame range** (e.g. V2 or full MH01 from frame 0).
+4. Upstream `loop_closure.py` had mapping gated to frame 0; this repo maps every keyframe.
 
 ## Acknowledgement
 

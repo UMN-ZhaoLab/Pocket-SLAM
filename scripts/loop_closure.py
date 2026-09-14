@@ -36,7 +36,8 @@ from utils.slam_helpers import (
     transform_to_frame, l1_loss_v1, matrix_to_quaternion
 )
 from utils.slam_external import (calc_ssim, build_rotation, prune_gaussians, densify,
-                                  compute_tile_budgets, pocket_slam_prune)
+                                  compute_tile_budgets, pocket_slam_prune, resolve_n_tar,
+                                  project_means_to_image)
 
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 
@@ -436,8 +437,21 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
         new_timestep = time_idx*torch.ones(new_pt_cld.shape[0],device="cuda").float()
         variables['timestep'] = torch.cat((variables['timestep'],new_timestep),dim=0)
         if 'pocket_grad_accum' in variables:
-            variables['pocket_grad_accum'] = torch.zeros(num_pts, device="cuda").float()
-            variables['pocket_denom'] = torch.zeros(num_pts, device="cuda").float()
+            # Pad accumulators — do NOT wipe tracking gradients for existing Gaussians
+            old_n = variables['pocket_grad_accum'].shape[0]
+            new_n = num_pts - old_n
+            if new_n > 0:
+                variables['pocket_grad_accum'] = torch.cat([
+                    variables['pocket_grad_accum'],
+                    torch.zeros(new_n, device="cuda").float(),
+                ], dim=0)
+                variables['pocket_denom'] = torch.cat([
+                    variables['pocket_denom'],
+                    torch.zeros(new_n, device="cuda").float(),
+                ], dim=0)
+            elif variables['pocket_grad_accum'].shape[0] != num_pts:
+                variables['pocket_grad_accum'] = torch.zeros(num_pts, device="cuda").float()
+                variables['pocket_denom'] = torch.zeros(num_pts, device="cuda").float()
 
     return params, variables
 
@@ -1116,20 +1130,32 @@ def rgbd_slam(config: dict, loop):
             # Pocket-SLAM: compute per-tile gradient budgets from tracking stage
             if config.get('pocket_slam', {}).get('enable', False):
                 pocket_cfg = config['pocket_slam']
+                n_tar = resolve_n_tar(pocket_cfg, params['means3D'].shape[0])
                 trk_cam = tracking_curr_data['cam']
                 with torch.no_grad():
+                    # Explicit projection — rasterizer means2D is a zero placeholder
+                    trk_gaussians = transform_to_frame(
+                        params, time_idx, gaussians_grad=False, camera_grad=False)
+                    pocket_means2d = project_means_to_image(
+                        trk_gaussians['means3D'], tracking_curr_data['intrinsics'])
+                    # Align accumulator length after any prior densify
+                    n = params['means3D'].shape[0]
+                    if variables['pocket_grad_accum'].shape[0] != n:
+                        variables['pocket_grad_accum'] = torch.zeros(n, device="cuda").float()
+                        variables['pocket_denom'] = torch.zeros(n, device="cuda").float()
                     tile_budgets = compute_tile_budgets(
                         variables['pocket_grad_accum'],
                         variables['pocket_denom'],
-                        variables['means2D'].detach(),
+                        pocket_means2d,
                         trk_cam.image_height,
                         trk_cam.image_width,
-                        N_tar=pocket_cfg.get('N_tar', params['means3D'].shape[0]),
+                        N_tar=n_tar,
                         tile_size=pocket_cfg.get('tile_size', 16),
-                        B_min=pocket_cfg.get('B_min', 1),
-                        B_max=pocket_cfg.get('B_max', None),
+                        B_min=pocket_cfg.get('B_min', 5),
+                        B_max=pocket_cfg.get('B_max', 200),
                     )
                 variables['tile_budgets'] = tile_budgets
+                variables['pocket_means2d_trk'] = pocket_means2d
         elif time_idx > 0 and config['tracking']['use_gt_poses']:
             with torch.no_grad():
                 # Get the ground truth pose relative to frame 0
@@ -1209,17 +1235,11 @@ def rgbd_slam(config: dict, loop):
             # Reset Optimizer & Learning Rates for Full Map Optimization
             optimizer = initialize_optimizer(params, config['mapping']['lrs'], tracking=False) 
 
-            # Mapping (every keyframe — was incorrectly gated to frame 0 only)
+            # Mapping every keyframe (upstream had a buggy `time_idx < 1` gate)
             mapping_start_time = time.time()
-            effective_mapping_iters = num_iters_mapping
-            if config.get('pocket_slam', {}).get('enable', False):
-                n_tar = config['pocket_slam'].get('N_tar', 60000)
-                n_gauss = params['means3D'].shape[0]
-                if n_gauss <= int(n_tar * 1.1):
-                    effective_mapping_iters = max(25, num_iters_mapping // 2)
-            if effective_mapping_iters > 0:
-                progress_bar = tqdm(range(effective_mapping_iters), desc=f"Mapping Time Step: {time_idx}")
-            for iter in range(effective_mapping_iters):
+            if num_iters_mapping > 0:
+                progress_bar = tqdm(range(num_iters_mapping), desc=f"Mapping Time Step: {time_idx}")
+            for iter in range(num_iters_mapping):
                     iter_start_time = time.time()
                     # Randomly select a frame until current time step amongst keyframes
                     rand_idx = np.random.randint(0, len(selected_keyframes))
@@ -1277,7 +1297,7 @@ def rgbd_slam(config: dict, loop):
                     iter_end_time = time.time()
                     mapping_iter_time_sum += iter_end_time - iter_start_time
                     mapping_iter_time_count += 1
-            if effective_mapping_iters > 0:
+            if num_iters_mapping > 0:
                 progress_bar.close()
             mapping_end_time = time.time()
             mapping_frame_time_sum += mapping_end_time - mapping_start_time
@@ -1285,30 +1305,75 @@ def rgbd_slam(config: dict, loop):
 
             # Pocket-SLAM: Rendering-Area-Aware Pruning with Tile-Level Budget
             if config.get('pocket_slam', {}).get('enable', False):
-                pocket_cfg = config['pocket_slam']
-                n_tar = pocket_cfg.get('N_tar', 60000)
-                if params['means3D'].shape[0] > int(n_tar * 0.95):
-                    with torch.no_grad():
-                        transformed_gaussians = transform_to_frame(
-                            params, time_idx, gaussians_grad=False, camera_grad=False)
-                        rendervar = transformed_params2rendervar(params, transformed_gaussians)
-                        rendervar['means2D'] = torch.zeros_like(
-                            params['means3D'], requires_grad=False, device="cuda")
-                        _, pocket_radius, _, _ = Renderer(raster_settings=curr_data['cam'])(**rendervar)
-                        pocket_means2D = rendervar['means2D']
-                        map_cam = curr_data['cam']
-                    params, variables = pocket_slam_prune(
-                        params, variables, optimizer,
-                        pocket_means2D, pocket_radius,
-                        time_idx,
+                pocket_cfg = dict(config['pocket_slam'])
+                with torch.no_grad():
+                    transformed_gaussians = transform_to_frame(
+                        params, time_idx, gaussians_grad=False, camera_grad=False)
+                    # Explicit pixel projection (rasterizer means2D stays zeros)
+                    pocket_means2D = project_means_to_image(
+                        transformed_gaussians['means3D'], curr_data['intrinsics'])
+                    rendervar = transformed_params2rendervar(params, transformed_gaussians)
+                    _, pocket_radius, _, _ = Renderer(raster_settings=curr_data['cam'])(**rendervar)
+                    map_cam = curr_data['cam']
+
+                    # Refresh N_tar + tile budgets after densification/mapping
+                    n_tar = resolve_n_tar(pocket_cfg, params['means3D'].shape[0])
+                    pocket_cfg['N_tar'] = n_tar
+                    n = params['means3D'].shape[0]
+                    if variables.get('pocket_grad_accum') is None or variables['pocket_grad_accum'].shape[0] != n:
+                        variables['pocket_grad_accum'] = torch.zeros(n, device="cuda").float()
+                        variables['pocket_denom'] = torch.zeros(n, device="cuda").float()
+                    variables['tile_budgets'] = compute_tile_budgets(
+                        variables['pocket_grad_accum'],
+                        variables['pocket_denom'],
+                        pocket_means2D,
                         map_cam.image_height,
                         map_cam.image_width,
-                        pocket_cfg,
+                        N_tar=n_tar,
+                        tile_size=pocket_cfg.get('tile_size', 16),
+                        B_min=pocket_cfg.get('B_min', 5),
+                        B_max=pocket_cfg.get('B_max', 200),
                     )
+                params, variables = pocket_slam_prune(
+                    params, variables, optimizer,
+                    pocket_means2D, pocket_radius,
+                    time_idx,
+                    map_cam.image_height,
+                    map_cam.image_width,
+                    pocket_cfg,
+                )
                 # Reset pocket accumulators for next tracking round
                 N_after = params['means3D'].shape[0]
                 variables['pocket_grad_accum'] = torch.zeros(N_after, device="cuda").float()
                 variables['pocket_denom']       = torch.zeros(N_after, device="cuda").float()
+
+                # Brief remapping after prune to heal holes / restore PSNR
+                post_prune_iters = int(pocket_cfg.get('post_prune_iters', 0))
+                if post_prune_iters > 0 and num_iters_mapping > 0:
+                    optimizer = initialize_optimizer(params, config['mapping']['lrs'], tracking=False)
+                    for _ in range(post_prune_iters):
+                        rand_idx = np.random.randint(0, len(selected_keyframes))
+                        selected_rand_keyframe_idx = selected_keyframes[rand_idx]
+                        if selected_rand_keyframe_idx == -1:
+                            iter_time_idx = time_idx
+                            iter_color = color
+                            iter_depth = depth
+                        else:
+                            iter_time_idx = keyframe_list[selected_rand_keyframe_idx]['id']
+                            iter_color = keyframe_list[selected_rand_keyframe_idx]['color']
+                            iter_depth = keyframe_list[selected_rand_keyframe_idx]['depth']
+                        iter_gt_w2c = gt_w2c_all_frames[:iter_time_idx+1]
+                        iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx,
+                                     'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c}
+                        loss, variables, losses = get_loss(
+                            params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
+                            config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
+                            config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'],
+                            mapping=True, grad_mask=grad_mask)
+                        loss.backward()
+                        with torch.no_grad():
+                            optimizer.step()
+                            optimizer.zero_grad(set_to_none=True)
 
             if time_idx == 0 or (time_idx+1) % config['report_global_progress_every'] == 0:
                 try:

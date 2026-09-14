@@ -165,9 +165,41 @@ def remove_points(to_remove, params, variables, optimizer):
     if 'timestep' in variables.keys():
         variables['timestep'] = variables['timestep'][to_keep]
     if 'pocket_grad_accum' in variables:
-        variables['pocket_grad_accum'] = variables['pocket_grad_accum'][to_keep]
-        variables['pocket_denom'] = variables['pocket_denom'][to_keep]
+        n_keep = int(to_keep.sum().item())
+        # Keep pocket buffers aligned with Gaussian count after densify/prune races
+        if variables['pocket_grad_accum'].shape[0] == to_keep.shape[0]:
+            variables['pocket_grad_accum'] = variables['pocket_grad_accum'][to_keep]
+            variables['pocket_denom'] = variables['pocket_denom'][to_keep]
+        else:
+            variables['pocket_grad_accum'] = torch.zeros(n_keep, device="cuda").float()
+            variables['pocket_denom'] = torch.zeros(n_keep, device="cuda").float()
     return params, variables
+
+
+def resolve_n_tar(prune_dict, n_gaussians):
+    """Paper: N_tar = 0.4 * N_init. Absolute N_tar overrides if provided."""
+    if prune_dict.get('N_tar') is not None:
+        return int(prune_dict['N_tar'])
+    ratio = float(prune_dict.get('N_tar_ratio', 0.4))
+    return max(1, int(n_gaussians * ratio))
+
+
+def project_means_to_image(means_cam, intrinsics):
+    """
+    Project camera-frame 3D Gaussian centers to pixel coordinates.
+
+    NOTE: rasterizer `means2D` is only an autograd placeholder (stays zeros);
+    Pocket-SLAM must project explicitly for tile assignment.
+    """
+    z = means_cam[:, 2].clamp(min=1e-4)
+    fx = intrinsics[0, 0]
+    fy = intrinsics[1, 1]
+    cx = intrinsics[0, 2]
+    cy = intrinsics[1, 2]
+    u = fx * (means_cam[:, 0] / z) + cx
+    v = fy * (means_cam[:, 1] / z) + cy
+    # (N, 3): u, v, z  — z kept so callers can mask behind-camera points
+    return torch.stack([u, v, means_cam[:, 2]], dim=-1)
 
 
 def compute_tile_budgets(pocket_grad_accum, pocket_denom, means2D,
@@ -182,17 +214,7 @@ def compute_tile_budgets(pocket_grad_accum, pocket_denom, means2D,
     G_k = (1/N_k) * sum_{i in T_k} g_i
     B_k = clip(floor(N_tar * G_k / sum_j G_j), B_min, B_max)
 
-    Args:
-        pocket_grad_accum: (N,) accumulated gradient magnitudes from tracking
-        pocket_denom:       (N,) accumulation counts
-        means2D:            (N, 3) projected 2D positions (x, y, _)
-        image_height/width: image dimensions
-        N_tar:              target total Gaussian count
-        tile_size:          tile size in pixels (default 16)
-        B_min/B_max:        min/max budget per tile
-
-    Returns:
-        tile_budgets: (H_tiles, W_tiles) int64 tensor on CUDA
+    Empty tiles stay at 0 (B_min only applied to occupied tiles).
     """
     num_tile_rows = (image_height + tile_size - 1) // tile_size
     num_tile_cols = (image_width + tile_size - 1) // tile_size
@@ -210,18 +232,24 @@ def compute_tile_budgets(pocket_grad_accum, pocket_denom, means2D,
 
     px = means2D[:, 0].detach()
     py = means2D[:, 1].detach()
+    # Optional depth channel for behind-camera masking
+    if means2D.shape[1] >= 3:
+        pz = means2D[:, 2].detach()
+        in_front = pz > 1e-3
+    else:
+        in_front = torch.ones_like(px, dtype=torch.bool)
 
-    valid = (px >= 0) & (px < image_width) & (py >= 0) & (py < image_height)
+    valid = in_front & (px >= 0) & (px < image_width) & (py >= 0) & (py < image_height)
     if valid.sum() == 0:
         return torch.full((num_tile_rows, num_tile_cols), uniform_budget,
                           device='cuda', dtype=torch.long)
 
-    px_v = px[valid].long()
-    py_v = py[valid].long()
+    px_v = px[valid]
+    py_v = py[valid]
     g_v  = grads[valid]
 
-    tile_col = (px_v // tile_size).clamp(0, num_tile_cols - 1)
-    tile_row = (py_v // tile_size).clamp(0, num_tile_rows - 1)
+    tile_col = (px_v / tile_size).long().clamp(0, num_tile_cols - 1)
+    tile_row = (py_v / tile_size).long().clamp(0, num_tile_rows - 1)
     tile_idx = tile_row * num_tile_cols + tile_col
 
     tile_grad_sum  = torch.zeros(num_tiles, device='cuda')
@@ -234,11 +262,16 @@ def compute_tile_budgets(pocket_grad_accum, pocket_denom, means2D,
     G_total = G_k.sum()
 
     if G_total < 1e-8:
-        return torch.full((num_tile_rows, num_tile_cols), uniform_budget,
-                          device='cuda', dtype=torch.long)
+        # No gradient signal: uniform budget only on occupied tiles
+        budgets = torch.zeros(num_tiles, device='cuda', dtype=torch.long)
+        occupied = tile_count > 0
+        budgets[occupied] = uniform_budget
+        return budgets.reshape(num_tile_rows, num_tile_cols)
 
     raw_budgets = (N_tar * G_k / G_total).floor().long()
-    tile_budgets = raw_budgets.clamp(min=B_min, max=B_max)
+    tile_budgets = torch.zeros_like(raw_budgets)
+    occupied = tile_count > 0
+    tile_budgets[occupied] = raw_budgets[occupied].clamp(min=B_min, max=B_max)
     return tile_budgets.reshape(num_tile_rows, num_tile_cols)
 
 
@@ -255,65 +288,86 @@ def pocket_slam_prune(params, variables, optimizer, means2D, radius,
          where B_k comes from the tracking-stage gradient budgets.
 
     Newly added Gaussians (variables['timestep'] == time_idx) are exempt.
-
-    Args:
-        params, variables, optimizer: SLAM state
-        means2D:      (N, 3) 2D projected positions for current frame
-        radius:       (N,)   2D screen-space radius from renderer
-        time_idx:     current frame index
-        image_height/width: image dimensions
-        prune_dict: dict with keys N_tar, B_min, B_max, tile_size
-
-    Returns:
-        params, variables (pruned)
+    means2D must be explicitly projected pixel coords (NOT rasterizer placeholder zeros).
     """
     tile_size = prune_dict.get('tile_size', 16)
-    N_tar     = prune_dict.get('N_tar', int(params['means3D'].shape[0] * 0.6))
-    B_min     = prune_dict.get('B_min', 1)
-    B_max     = prune_dict.get('B_max', N_tar)
+    N = params['means3D'].shape[0]
+    N_tar     = resolve_n_tar(prune_dict, N)
+    B_min     = prune_dict.get('B_min', 5)
+    B_max     = prune_dict.get('B_max', 200)
+    use_global_cap = prune_dict.get('global_cap', False)
+    # 0 = protect only Gaussians added at this frame (paper default)
+    protect_age = int(prune_dict.get('protect_age', 0))
+    warmup_frames = int(prune_dict.get('warmup_frames', 1))
+    prune_interval = int(prune_dict.get('prune_interval', 1))
+    score_opacity_weight = float(prune_dict.get('score_opacity_weight', 0.0))
+    prune_margin = float(prune_dict.get('prune_margin', 1.0))
+
+    # Warmup / interval / already under target
+    if time_idx < warmup_frames:
+        print(f"[Pocket-SLAM] Skip prune (warmup time_idx={time_idx})")
+        return params, variables
+    if prune_interval > 1 and (time_idx % prune_interval) != 0:
+        print(f"[Pocket-SLAM] Skip prune (interval time_idx={time_idx})")
+        return params, variables
+    if N <= int(N_tar * prune_margin):
+        print(f"[Pocket-SLAM] Skip prune (N={N} <= N_tar*{prune_margin}={int(N_tar * prune_margin)})")
+        return params, variables
 
     num_tile_rows = (image_height + tile_size - 1) // tile_size
     num_tile_cols = (image_width  + tile_size - 1) // tile_size
 
-    N = params['means3D'].shape[0]
-
     # --- Tile budgets (from tracking-stage gradients) ---
+    # Do NOT shrink budgets by protected count — that starves mature Gaussians
+    # whenever densification adds a large batch and tanks PSNR.
     if 'tile_budgets' in variables:
         tile_budgets = variables['tile_budgets']
     else:
         uniform = max(B_min, N_tar // max(num_tile_rows * num_tile_cols, 1))
         tile_budgets = torch.full((num_tile_rows, num_tile_cols), uniform,
                                   device='cuda', dtype=torch.long)
-    tile_budgets_flat = tile_budgets.reshape(-1).clamp(min=B_min, max=B_max)
+    tile_budgets_flat = tile_budgets.reshape(-1)
 
-    # --- Rendering-area score S_i ---
+    # --- Score: rendering-area (paper) + optional opacity mix ---
     opacities = torch.sigmoid(params['logit_opacities']).squeeze(-1).detach()
     radii     = radius.detach().float()
     C = opacities * np.pi * (radii ** 2)
-
     C_total = C.sum()
     if C_total < 1e-8:
         return params, variables
-    S = C / C_total  # (N,)
+    area_score = C / C_total
+    w = min(max(score_opacity_weight, 0.0), 1.0)
+    if w > 0:
+        op_score = opacities / (opacities.sum() + 1e-8)
+        S = (1.0 - w) * area_score + w * op_score
+    else:
+        S = area_score
 
-    # --- 2D positions ---
+    # --- 2D positions (explicit projection; do not use rasterizer placeholder) ---
     px = means2D[:, 0].detach()
     py = means2D[:, 1].detach()
+    if means2D.shape[1] >= 3:
+        pz = means2D[:, 2].detach()
+        in_front = pz > 1e-3
+    else:
+        in_front = torch.ones(N, dtype=torch.bool, device=px.device)
 
-    # Newly added Gaussians are exempt from pruning this round
-    new_mask = (variables['timestep'] == time_idx)
+    # Protect newly added Gaussians (paper: current frame; optional age window)
+    new_mask = variables['timestep'] >= (time_idx - protect_age)
 
     # Old, in-frame, visible Gaussians are candidates for pruning
-    in_frame = ((px >= 0) & (px < image_width) &
+    in_frame = (in_front &
+                (px >= 0) & (px < image_width) &
                 (py >= 0) & (py < image_height) &
                 (~new_mask) & (radii > 0))
 
-    # Start with: keep new Gaussians and out-of-frame old Gaussians
+    # Keep new Gaussians and out-of-frame / behind-camera old Gaussians
     to_keep = new_mask.clone()
     to_keep[~in_frame & ~new_mask] = True
 
-    old_in_frame_idx = torch.where(in_frame)[0]   # (M,)
+    old_in_frame_idx = torch.where(in_frame)[0]
     M = old_in_frame_idx.shape[0]
+    budget_sum = int(tile_budgets_flat.sum().item())
 
     if M > 0:
         px_old = px[old_in_frame_idx]
@@ -322,7 +376,7 @@ def pocket_slam_prune(params, variables, optimizer, means2D, radius,
 
         tile_col_idx = (px_old / tile_size).long().clamp(0, num_tile_cols - 1)
         tile_row_idx = (py_old / tile_size).long().clamp(0, num_tile_rows - 1)
-        tile_idx = tile_row_idx * num_tile_cols + tile_col_idx  # (M,)
+        tile_idx = tile_row_idx * num_tile_cols + tile_col_idx
 
         # Sort by (tile_idx ascending, S descending) → within-tile rank 0 = highest S
         sort_key = tile_idx.float() * 1e8 - S_old
@@ -330,34 +384,41 @@ def pocket_slam_prune(params, variables, optimizer, means2D, radius,
 
         sorted_tile_idx = tile_idx[sort_order]
 
-        # Within-tile rank using cumsum trick
         tile_change = torch.cat([
             torch.ones(1, dtype=torch.bool, device='cuda'),
             sorted_tile_idx[1:] != sorted_tile_idx[:-1]
         ])
-        tile_group          = tile_change.cumsum(0) - 1          # (M,) group id
-        tile_start_pos      = torch.where(tile_change)[0]        # start idx of each group
+        tile_group          = tile_change.cumsum(0) - 1
+        tile_start_pos      = torch.where(tile_change)[0]
         within_tile_rank    = (torch.arange(M, device='cuda')
-                               - tile_start_pos[tile_group])     # (M,)
+                               - tile_start_pos[tile_group])
 
-        budgets_per_elem    = tile_budgets_flat[sorted_tile_idx] # (M,)
-        keep_in_sorted      = within_tile_rank < budgets_per_elem
+        # Per-tile budget; empty tiles stay 0 from compute_tile_budgets
+        budgets_per_elem = tile_budgets_flat[sorted_tile_idx].clamp(min=0, max=B_max)
+        keep_in_sorted = within_tile_rank < budgets_per_elem
 
         orig_sorted = old_in_frame_idx[sort_order]
         to_keep[orig_sorted[keep_in_sorted]] = True
 
     to_remove = ~to_keep
-    pruned = to_remove.sum().item()
+    pruned = int(to_remove.sum().item())
+    n_new = int(new_mask.sum().item())
+    n_tiles_used = int((tile_budgets_flat > 0).sum().item())
 
     if pruned > 0:
         params, variables = remove_points(to_remove, params, variables, optimizer)
         torch.cuda.empty_cache()
-        print(f"[Pocket-SLAM] Pruned {pruned} Gaussians → remaining: {params['means3D'].shape[0]}")
+        print(
+            f"[Pocket-SLAM] Pruned {pruned} → remaining: {params['means3D'].shape[0]} "
+            f"(N_tar={N_tar}, in_frame={M}, new={n_new}, budget_sum={budget_sum}, "
+            f"active_tiles={n_tiles_used})"
+        )
+    else:
+        print(f"[Pocket-SLAM] No prune (in_frame={M}, N={N}, N_tar={N_tar})")
 
-    # Global cap: tile budgets are per-tile and out-of-frame Gaussians are kept,
-    # so enforce N_tar with a gradient-aware global top-k pass.
+    # Optional global cap (off by default; paper uses per-tile budgets only).
     N_after = params['means3D'].shape[0]
-    if N_after > N_tar:
+    if use_global_cap and N_after > N_tar:
         grad_score = variables.get('pocket_grad_accum', torch.zeros(N_after, device='cuda'))
         grad_score = grad_score / (variables.get('pocket_denom', torch.ones(N_after, device='cuda')) + 1e-8)
         grad_score = grad_score.detach()
@@ -369,8 +430,7 @@ def pocket_slam_prune(params, variables, optimizer, means2D, radius,
         opacity_score = opacities / (opacities.max() + 1e-8)
         combined = 0.5 * opacity_score + 0.5 * grad_score
 
-        # Always protect Gaussians added in the current mapping round.
-        protected = (variables['timestep'] == time_idx)
+        protected = variables['timestep'] >= (time_idx - protect_age)
         keep_mask = torch.zeros(N_after, dtype=torch.bool, device='cuda')
         n_protected = int(protected.sum().item())
         n_slots = max(N_tar - n_protected, 0)

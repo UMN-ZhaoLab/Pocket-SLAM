@@ -45,7 +45,14 @@ class EurocDataset(GradSLAMDataset):
 
     def get_filepaths(self):
         color_paths = natsorted(glob.glob(f"{self.input_folder}/data_rect/*.png"))
-        depth_paths = natsorted(glob.glob(f"{self.input_folder}/depth_sgbm/*.npy"))
+        # Paper / LSG-SLAM use IGEV SceneFlow depths (depth_sceneflow).
+        # Fall back to SGBM only if IGEV depths are missing.
+        depth_paths = natsorted(glob.glob(f"{self.input_folder}/depth_sceneflow/*.npy"))
+        if len(depth_paths) == 0:
+            depth_paths = natsorted(glob.glob(f"{self.input_folder}/depth_sgbm/*.npy"))
+            if len(depth_paths) > 0:
+                print("[EurocDataset] WARNING: using depth_sgbm (SGBM). "
+                      "Paper results require depth_sceneflow from IGEV.")
         feature_paths = natsorted(glob.glob(f"{self.input_folder}/global_features/*.npy"))
         embedding_paths = None
         if self.load_embeddings:

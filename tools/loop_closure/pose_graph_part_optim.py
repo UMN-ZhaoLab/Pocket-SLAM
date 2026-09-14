@@ -439,9 +439,19 @@ def get_dataset(config_dict, basedir, sequence, **kwargs):
 
 if __name__ == "__main__":
 
-    base_folder = 'MH_01_easy' # path to folder with loop closure results
-    scene_name = 'MH_01_easy'
-    dataset_type = 'euroc' # kitti or euroc
+    parser = argparse.ArgumentParser(description="LSG-SLAM pose-graph backend + structure refine")
+    parser.add_argument("--base_folder", type=str, default="MH_01_easy",
+                        help="Folder containing odometry chunks + *_loops")
+    parser.add_argument("--scene_name", type=str, default="MH_01_easy")
+    parser.add_argument("--dataset_type", type=str, default="euroc", choices=["euroc", "kitti"])
+    parser.add_argument("--structure_refine_iters", type=int, default=5000)
+    parser.add_argument("--skip_structure_refine", action="store_true",
+                        help="Only run pose-graph ATE (no map PSNR refine)")
+    args = parser.parse_args()
+
+    base_folder = args.base_folder
+    scene_name = args.scene_name
+    dataset_type = args.dataset_type
     if dataset_type == 'kitti':
         kitti_base_folder = '' 
         image_folder_path = os.path.join(kitti_base_folder, scene_name, 'image_2')
@@ -462,9 +472,11 @@ if __name__ == "__main__":
     overlap = False
     overlap_bound = 20
 
-    structure_refine_total_iters = 5000 # 2000, 5000
+    structure_refine_total_iters = args.structure_refine_iters
+    # EuRoC uses smaller means3D LR than KITTI (see upstream comments)
+    means3d_lr = 0.0001 if dataset_type == 'euroc' else 0.0008
     structure_refine_lrs=dict(
-        means3D=0.0008, # 0.0001 in euroc, 0.0008 in kitti
+        means3D=means3d_lr,
         rgb_colors=0.0025,
         unnorm_rotations=0.001,
         logit_opacities=0.05,
@@ -474,7 +486,7 @@ if __name__ == "__main__":
     )
 
     structure_refine_lrs_decay1=dict(
-        means3D=0.0001, # 0.0001 in euroc, 0.0008 in kitti
+        means3D=0.0001,
         rgb_colors=0.0025,
         unnorm_rotations=0.001,
         logit_opacities=0.05,
@@ -484,7 +496,7 @@ if __name__ == "__main__":
     )
 
     structure_refine_lrs_decay2=dict(
-        means3D=0.0001, # 0.0001 in euroc, 0.0008 in kitti
+        means3D=0.0001,
         rgb_colors=0.0025,
         unnorm_rotations=0.001,
         logit_opacities=0.05,
@@ -725,6 +737,18 @@ if __name__ == "__main__":
         video.write(cv2.imread(os.path.join(fig_save_dir, image)))
 
     video.release()
+
+    # Save pose-graph ATE summary early
+    with open(os.path.join(save_dir, 'ate_summary.txt'), 'w') as f:
+        f.write(f"odo_align_ate_m={est_align_avg_trans_error}\n")
+        f.write(f"odo_abs_ate_m={est_abs_avg_trans_error}\n")
+        f.write(f"loop_align_ate_m={loop_align_avg_trans_error}\n")
+        f.write(f"loop_abs_ate_m={loop_abs_avg_trans_error}\n")
+    print(f"[PoseGraph] Saved ATE summary to {save_dir}/ate_summary.txt")
+
+    if args.skip_structure_refine:
+        print("[PoseGraph] skip_structure_refine=True — done after pose-graph ATE")
+        raise SystemExit(0)
 
     # pose optimization end, begin to optimize map
     for j in range(loop_trajs.shape[0]):

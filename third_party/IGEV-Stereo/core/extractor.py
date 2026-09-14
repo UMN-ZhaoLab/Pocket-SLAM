@@ -333,7 +333,8 @@ class Feature(SubModule):
         chans = [16, 24, 32, 96, 160]
         self.conv_stem = model.conv_stem
         self.bn1 = model.bn1
-        self.act1 = model.act1
+        # timm>=1.0 folds ReLU6 into BatchNormAct2d; older timm exposes model.act1
+        self.act1 = getattr(model, 'act1', None)
 
         self.block0 = torch.nn.Sequential(*model.blocks[0:layers[0]])
         self.block1 = torch.nn.Sequential(*model.blocks[layers[0]:layers[1]])
@@ -347,7 +348,9 @@ class Feature(SubModule):
         self.conv4 = BasicConv_IN(chans[1]*2, chans[1]*2, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x):
-        x = self.act1(self.bn1(self.conv_stem(x)))
+        x = self.bn1(self.conv_stem(x))
+        if self.act1 is not None:
+            x = self.act1(x)
         x2 = self.block0(x)
         x4 = self.block1(x2)
         x8 = self.block2(x4)
